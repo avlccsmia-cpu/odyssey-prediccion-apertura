@@ -1,0 +1,13 @@
+# Datos y caché en tiempo de ejecución: se regeneran solos, no se versionan
+data/
+logs/
+hub/data/
+hub/logs/
+
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.env.*
+*.parquet
+*.log
