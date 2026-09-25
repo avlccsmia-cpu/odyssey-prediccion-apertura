@@ -52,6 +52,14 @@ precios, backtest, informes `apertura_mdn_informe.md` y `opciones_informe.md`,
 el archivo de proyecciones en `proyecciones/`, `evaluaciones.jsonl` e
 `informes_semanales/`. La IV propia se guarda en `data/raw/iv_diaria/`.
 
+Sin el dato de pre-market (tras el cierre, `--pre-cierre`, reconstrucciones
+o `--vivo` fallido) la proyección usa el modelo entrenado sin pre-market, y
+el backtest que la acompaña corresponde a ese modelo. En el backtest de 250
+sesiones del 25-sep-2026 esto subió la cobertura del intervalo del 80 % de
+58-70 % a 72-81 % y mejoró el CRPS en los cinco tickers. La proyección con
+pre-market de las 09:15 es la que aporta dirección; la de la tarde apenas
+mejora al baseline empírico de 250 días.
+
 Cómo se mide la exactitud: cada proyección se archiva al generarse y se compara
 con la apertura oficial de la barra diaria de IBKR (percentil, cobertura de los
 intervalos, dirección, error contra "abre igual que el cierre" y CRPS contra el

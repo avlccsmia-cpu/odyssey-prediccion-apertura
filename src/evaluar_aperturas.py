@@ -157,6 +157,7 @@ def main():
         e = {
             "ticker": t, "apertura_objetivo": r["apertura_objetivo"], "fecha_apertura_real": str(f_open.date()),
             "modo": r["modo"], "reconstruida": bool(r.get("reconstruida", False)), "generado": r["generado"],
+            "modelo_prediccion": r.get("modelo_prediccion", "anterior"),
             "cierre_ref_fecha": r["ultimo_cierre_fecha"], "cierre_ref": c0, "open_real": round(o, 4),
             "gap_real_pct": round(gap, 4), "gap_mediana_pct": r["gap_mediana_pct"],
             "p_gap_pos": r.get("prob_gap_positivo"), "pit": round(pit, 4),

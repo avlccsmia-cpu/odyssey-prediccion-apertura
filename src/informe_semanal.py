@@ -40,6 +40,12 @@ def cargar(out_dir):
     if not os.path.exists(ruta):
         return pd.DataFrame()
     e = pd.DataFrame([json.loads(l) for l in open(ruta) if l.strip()])
+    if "modelo_prediccion" not in e:
+        e["modelo_prediccion"] = "anterior"
+    e["modelo_prediccion"] = e["modelo_prediccion"].fillna("anterior")
+    # antes del 25-sep-2026 las proyecciones sin pre-market usaban el modelo completo: van en su propia fila
+    e["modo"] = np.where(e["modelo_prediccion"] == "anterior",
+                         np.where(e["modo"] == "vivo", "vivo", e["modo"] + " (modelo anterior)"), e["modo"])
     e = e.sort_values("generado").groupby(["ticker", "apertura_objetivo", "modo"], as_index=False).tail(1)
     e["fecha"] = pd.to_datetime(e["fecha_apertura_real"])
     return e

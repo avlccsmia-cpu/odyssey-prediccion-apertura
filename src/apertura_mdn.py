@@ -659,16 +659,31 @@ def procesar(ticker, spy, spy_0900, args, rng) -> dict:
                             "hoy": bool(ultima[col].iloc[0] == 1.0)}
     log("  disponibilidad: " + ", ".join(f"{k} train {v['train']:.0%} test {v['test']:.0%} hoy {'sí' if v['hoy'] else 'no'}" for k, v in disp.items()))
 
-    ens = Ensamble(cols_all, train, val, args, rng)
+    # Sin el dato de pre-market en la fila a predecir (tras el cierre, --pre-cierre,
+    # reconstrucción o --vivo fallido) se usa el modelo entrenado sin pre-market:
+    # el completo, con el pre-market marcado como ausente, recibe un caso que casi no
+    # vio al entrenar y salía con intervalos demasiado estrechos (evaluación del 25-sep-2026).
+    hay_on = cols_sin_on != cols_all
+    con_premarket = hay_on and float(ultima["on_disp"].iloc[0]) == 1.0
+    usar_sin_on = hay_on and not con_premarket
+    ens_completo = Ensamble(cols_all, train, val, args, rng) if (not usar_sin_on or args.ablacion) else None
+    ens_sin_on = Ensamble(cols_sin_on, train, val, args, rng) if (usar_sin_on or (args.ablacion and hay_on)) else None
+    ens = ens_sin_on if usar_sin_on else ens_completo
+    modelo_prediccion = "con_premarket" if con_premarket else "sin_premarket"
+    log(f"  modelo de la proyección: {'con' if con_premarket else 'sin'} pre-market")
     ablacion = {}
     if args.ablacion:
-        if cols_sin_on != cols_all:
-            ablacion["mdn_sin_overnight"] = Ensamble(cols_sin_on, train, val, args, rng)
+        if usar_sin_on:
+            ablacion["mdn_con_premarket"] = ens_completo
+        elif hay_on:
+            ablacion["mdn_sin_overnight"] = ens_sin_on
         if cols_base != cols_sin_on:
             ablacion["mdn_solo_cierres"] = Ensamble(cols_base, train, val, args, rng)
 
     y_test = test["target"].values
     S_test = ens.muestras(test, rng)
+    test_sin_on = test.copy()
+    test_sin_on.loc[:, [c for c in COLS_ON if c in test.columns]] = 0.0   # como si no hubiera dato de pre-market
     gaps_all = hist["target"].values
     idx0 = len(hist) - n_test
     S_emp = np.array([baseline_empirico(gaps_all[:idx0 + i], args.mc, rng) for i in range(n_test)])
@@ -677,7 +692,10 @@ def procesar(ticker, spy, spy_0900, args, rng) -> dict:
         "n_dias": int(n_test),
         "desde": str(test["fecha_next"].iloc[0].date()), "hasta": str(test["fecha_next"].iloc[-1].date()),
         "mdn": resumen_modelo(S_test, y_test),
+        "modelo_prediccion": modelo_prediccion,
         **{k: resumen_modelo(e.muestras(test, rng), y_test) for k, e in ablacion.items()},
+        **({"mdn_con_premarket_sin_dato": resumen_modelo(ens_completo.muestras(test_sin_on, rng), y_test)}
+           if (args.ablacion and hay_on and ens_completo is not None) else {}),
         "baseline_empirico_250": resumen_modelo(S_emp, y_test),
         "baseline_ewma_bootstrap": resumen_modelo(S_ewm, y_test),
         "pit_mdn_media": round(float(np.mean([(s < yy).mean() for s, yy in zip(S_test, y_test)])), 3),
@@ -725,6 +743,7 @@ def procesar(ticker, spy, spy_0900, args, rng) -> dict:
         "modo": ("reconstruida" if HASTA is not None else "vivo" if vivo else "pre_cierre" if args.pre_cierre
                  else "cierre_sin_overnight" if args.overnight else "solo_cierres"),
         "reconstruida": HASTA is not None,
+        "modelo_prediccion": modelo_prediccion,
         "overnight_usado": ({k: (round(v, 4) if isinstance(v, float) else v) for k, v in vivo.items()} if vivo else None),
         "iv_vivo_usado": ivv,
         "features_hoy": {c: round(float(ultima[c].iloc[0]), 4) for c in COLS_ON + COLS_IV + COLS_M5 if c in ultima.columns},
@@ -743,7 +762,9 @@ def procesar(ticker, spy, spy_0900, args, rng) -> dict:
 # ----------------------------------------------------------------------------
 # Informe
 # ----------------------------------------------------------------------------
-NOMBRES = [("mdn", "MDN completo"), ("mdn_sin_overnight", "MDN sin overnight"), ("mdn_solo_cierres", "MDN solo cierres"),
+NOMBRES = [("mdn", "MDN usado"), ("mdn_con_premarket", "MDN con pre-market"),
+           ("mdn_sin_overnight", "MDN sin pre-market"), ("mdn_con_premarket_sin_dato", "Con pre-market, sin dato"),
+           ("mdn_solo_cierres", "MDN solo cierres"),
            ("baseline_empirico_250", "Empírico 250 d"), ("baseline_ewma_bootstrap", "EWMA + bootstrap")]
 
 
