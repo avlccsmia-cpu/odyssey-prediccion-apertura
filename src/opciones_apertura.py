@@ -164,7 +164,7 @@ def tabla_md(res, lado):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("tickers", nargs="*", default=["SPY", "AAPL", "META", "MSFT"])
+    ap.add_argument("tickers", nargs="*", default=["SPY", "AAPL", "META", "MSFT", "NVDA"])
     ap.add_argument("--expiries", nargs="*", default=viernes_siguientes(2))
     ap.add_argument("--width", type=int, default=10)
     ap.add_argument("--comision", type=float, default=2.0, help="USD por contrato, ida y vuelta")

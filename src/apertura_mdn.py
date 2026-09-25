@@ -79,6 +79,10 @@ if not os.path.isdir(BARS5M_DIR):   # corriendo desde otra copia del repo: usar 
 LITE_DIR = os.path.expanduser("~/Desktop/SENTINEL-lite/sentinel-lite")
 HUB_URL = "http://127.0.0.1:8791"
 CACHE_DIR = os.path.join(RAIZ, "data", "raw", "hub_cache")
+IV_DIARIA_DIR = os.path.join(RAIZ, "data", "raw", "iv_diaria")      # captura propia (src/capturar_iv.py)
+PROY_DIR = os.path.join(OUT_DIR, "proyecciones")                    # archivo de cada proyección generada
+TICKERS_DEF = ["SPY", "AAPL", "META", "MSFT", "NVDA"]
+HASTA = None   # --hasta: reconstruir la proyección con datos solo hasta ese cierre (pd.Timestamp)
 _HUB_HIST_CAIDO = [False]   # se activa al primer timeout del histórico: el resto usa caché
 NIVELES = [60, 65, 70, 75, 80, 85, 90, 95, 99, 100]
 ESCALERA = [99, 95, 90, 80, 70, 60, 50, 40, 30, 20, 10, 5, 2.5, 1]   # P(apertura >= precio)
@@ -183,6 +187,9 @@ def descargar(ticker: str, periodo: str = "15 Y") -> pd.DataFrame:
     salvo en modo --pre-cierre, donde la vela parcial (sin cache) es la referencia."""
     ahora = pd.Timestamp.now(tz=ET)
     en_sesion = ahora.time() < dt.time(16, 5)
+    if HASTA is not None:        # reconstrucción: nada posterior al cierre de HASTA
+        df = hub_bars(ticker, periodo, "1 day", rth=1).dropna()
+        return df[df.index <= HASTA]
     df = hub_bars(ticker, periodo, "1 day", rth=1, cache=not (PRE_CIERRE and en_sesion)).dropna()
     if len(df) and df.index[-1].date() == ahora.date() and en_sesion and not PRE_CIERRE:
         df = df.iloc[:-1]
@@ -311,7 +318,25 @@ def iv_vivo(ticker: str, spot: float) -> dict | None:
     return {"iv_atm": float(np.mean(ivs)), "skew": float(skew), "expiry": expiry, "spot_hub": spot_hub}
 
 
-def features_iv(ticker: str, theta_dir: str) -> pd.DataFrame | None:
+def features_iv(ticker: str, theta_dir: str, iv_dir: str = IV_DIARIA_DIR) -> pd.DataFrame | None:
+    """iv_atm y skew por fecha: snapshots de theta_vacuum (15:30 ET) unidos a la
+    captura propia diaria de data/raw/iv_diaria (~15:40 ET, misma definición).
+    Si una fecha está en las dos, manda la captura propia."""
+    theta = _iv_theta_vacuum(ticker, theta_dir)
+    ruta = os.path.join(iv_dir, f"{ticker}.csv")
+    propia = None
+    if os.path.exists(ruta):
+        c = pd.read_csv(ruta)
+        if len(c):
+            propia = c.assign(fecha=pd.to_datetime(c["fecha"])).set_index("fecha")[["iv_atm", "skew"]].sort_index()
+    if propia is None:
+        return theta
+    if theta is None:
+        return propia
+    return propia.combine_first(theta).sort_index()
+
+
+def _iv_theta_vacuum(ticker: str, theta_dir: str) -> pd.DataFrame | None:
     """iv_atm y skew por fecha desde los snapshots de opciones de theta_vacuum."""
     fs = sorted(glob.glob(os.path.join(theta_dir, ticker, "*", "*.parquet")))
     if not fs:
@@ -579,7 +604,7 @@ def baseline_ewma(gaps_hist, n, rng, lam=0.94):
 def procesar(ticker, spy, spy_0900, args, rng) -> dict:
     df = descargar(ticker, args.periodo)
     on = overnight_historico(ticker, df, spy, spy_0900) if args.overnight else None
-    iv = features_iv(ticker, args.theta_dir) if args.iv else None
+    iv = features_iv(ticker, args.theta_dir, args.iv_dir) if args.iv else None
     m5 = features_5m(ticker, args.bars5m_dir, df) if args.m5 else None
     f = construir_features(df, None if ticker == "SPY" else spy, on, iv, m5)
     cols_all = [c for c in f.columns if c not in AUX]
@@ -697,7 +722,9 @@ def procesar(ticker, spy, spy_0900, args, rng) -> dict:
         "generado": dt.datetime.now().isoformat(timespec="seconds"),
         "ultimo_cierre_fecha": str(ultima.index[0].date()), "ultimo_cierre": round(c0, 2),
         "apertura_objetivo": str(pd.Timestamp(ultima["fecha_next"].iloc[0]).date()),
-        "modo": "vivo" if vivo else ("cierre_sin_overnight" if args.overnight else "solo_cierres"),
+        "modo": ("reconstruida" if HASTA is not None else "vivo" if vivo else "pre_cierre" if args.pre_cierre
+                 else "cierre_sin_overnight" if args.overnight else "solo_cierres"),
+        "reconstruida": HASTA is not None,
         "overnight_usado": ({k: (round(v, 4) if isinstance(v, float) else v) for k, v in vivo.items()} if vivo else None),
         "iv_vivo_usado": ivv,
         "features_hoy": {c: round(float(ultima[c].iloc[0]), 4) for c in COLS_ON + COLS_IV + COLS_M5 if c in ultima.columns},
@@ -708,7 +735,7 @@ def procesar(ticker, spy, spy_0900, args, rng) -> dict:
         "backtest": bt, "detalle_test": detalle,
         "config": {"k": args.k, "semillas": args.semillas, "mc": args.mc, "features": cols_all,
                    "fuentes": {"diario": "IBKR hub 1 day", "overnight": "IBKR hub 1 hour rth=0" if on is not None else None,
-                               "iv": args.theta_dir if iv is not None else None,
+                               "iv": [args.theta_dir, args.iv_dir] if iv is not None else None,
                                "m5": args.bars5m_dir if m5 is not None else None}},
     }
 
@@ -769,9 +796,22 @@ def informe_md(resultados) -> str:
     return "\n".join(L) + "\n"
 
 
+def archivar_proyeccion(r: dict) -> str:
+    """Copia compacta (sin el detalle día a día del backtest) de cada proyección,
+    en proyecciones/<apertura_objetivo>/<TICKER>_<modo>_<generado>.json. Es lo que
+    evalúa src/evaluar_aperturas.py; nada se sobrescribe."""
+    d = os.path.join(PROY_DIR, r["apertura_objetivo"])
+    os.makedirs(d, exist_ok=True)
+    marca = r["generado"].replace(":", "").replace("-", "")
+    ruta = os.path.join(d, f"{r['ticker']}_{r['modo']}_{marca}.json")
+    with open(ruta, "w") as fh:
+        json.dump({k: v for k, v in r.items() if k != "detalle_test"}, fh, indent=1, ensure_ascii=False)
+    return ruta
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("tickers", nargs="*", default=["SPY", "AAPL", "META", "MSFT"])
+    ap.add_argument("tickers", nargs="*", default=TICKERS_DEF)
     ap.add_argument("--dias-test", type=int, default=21, help="sesiones del backtest (defecto 21 ≈ 1 mes)")
     ap.add_argument("--periodo", default="15 Y", help="duración IBKR del diario (ej. '15 Y')")
     ap.add_argument("--k", type=int, default=3)
@@ -788,14 +828,22 @@ def main():
     ap.add_argument("--sin-calibrar", dest="calibrar", action="store_false")
     ap.add_argument("--sin-informe", action="store_true")
     ap.add_argument("--theta-dir", default=THETA_DIR)
+    ap.add_argument("--iv-dir", default=IV_DIARIA_DIR, help="captura propia diaria de IV (capturar_iv.py)")
+    ap.add_argument("--hasta", default=None, metavar="YYYY-MM-DD",
+                    help="reconstruir la proyección que se habría hecho tras el cierre de esa fecha, "
+                         "sin usar ningún dato posterior. Solo archiva: no toca los ficheros vigentes")
     ap.add_argument("--bars5m-dir", default=BARS5M_DIR)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--etiqueta", default="")
     args = ap.parse_args()
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    global PRE_CIERRE
+    global PRE_CIERRE, HASTA
     PRE_CIERRE = bool(args.pre_cierre)
+    if args.hasta:
+        if args.vivo or args.pre_cierre:
+            ap.error("--hasta no se combina con --vivo ni --pre-cierre")
+        HASTA = pd.Timestamp(args.hasta)
     rng = np.random.default_rng(args.seed)
     if not hub_ok():
         log(f"ERROR: el hub IBKR no responde o no está conectado en {HUB_URL}. "
@@ -812,8 +860,11 @@ def main():
             log(f"[{t}] ERROR: {e!r}. Sigo con el resto.")
             continue
         resultados.append(r)
-        with open(os.path.join(OUT_DIR, f"apertura_mdn_{t}{args.etiqueta}.json"), "w") as fh:
-            json.dump(r, fh, indent=1, ensure_ascii=False)
+        if not args.etiqueta:
+            archivar_proyeccion(r)
+        if HASTA is None:
+            with open(os.path.join(OUT_DIR, f"apertura_mdn_{t}{args.etiqueta}.json"), "w") as fh:
+                json.dump(r, fh, indent=1, ensure_ascii=False)
         print(f"\n{t}: cierre {r['ultimo_cierre_fecha']} = {r['ultimo_cierre']}  ->  apertura {r['apertura_objetivo']}   "
               f"P(gap>0)={r['prob_gap_positivo']:.0%}  modo={r['modo']}")
         print(f"  {'Prob':>6} {'Open mín':>10} {'Open máx':>10} {'Gap mín%':>9} {'Gap máx%':>9}")
@@ -830,6 +881,8 @@ def main():
                 print(f"    {nombre:18s} CRPS {m['crps']:.3f}  signo {m['acierto_signo']:.0%}  MAE {m['mae_mediana_pct']:.3f}  "
                       f"cob80 {m['cobertura']['80']:.0%}  cob95 {m['cobertura']['95']:.0%}  ancho90 {m['ancho_90_pct']:.2f}")
 
+    if HASTA is not None:
+        return
     resumen = [{k: r[k] for k in ("ticker", "ultimo_cierre_fecha", "ultimo_cierre", "apertura_objetivo", "modo", "overnight_usado",
                                   "features_hoy", "prob_gap_positivo", "gap_mediana_pct", "gap_sigma_pct", "tabla", "escalera")}
                | {"crps": {k: r["backtest"][k]["crps"] for k, _ in NOMBRES if k in r["backtest"]}} for r in resultados]

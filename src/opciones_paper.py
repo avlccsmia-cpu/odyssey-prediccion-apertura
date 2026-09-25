@@ -3,11 +3,14 @@
 opciones_paper.py — Medición en papel, en la apertura, de lo que marcó
 opciones_apertura.py la tarde anterior. SOLO REGISTRO: no envía órdenes.
 
-Correr ~09:36 ET (con reintentos a 10:30 y 12:30 por si el histórico de IBKR
-no responde a la apertura; es idempotente: no repite un ticker ya medido). Para cada ticker:
+Correr ~09:36 ET. Solo mide entre las 09:31 y las 10:05 ET del día objetivo:
+fuera de esa ventana las cotizaciones ya no son las de la apertura y el P&L no
+sería comparable, así que no registra nada. La exactitud de la apertura en sí
+la evalúa src/evaluar_aperturas.py, que se pone al día solo. Es idempotente:
+no repite un ticker ya medido. Para cada ticker:
   1. Lee data/derived/apertura_mdn/opciones_<T>.json (entrada de la sesión previa)
      y apertura_mdn_<T>.json (distribución prevista para hoy).
-  2. Apertura real de hoy (hub, 1 min RTH): gap real, percentil (PIT) dentro de
+  2. Apertura real de hoy (barra diaria oficial; si no, 1ª vela de 1 min): gap real, percentil (PIT) dentro de
      la distribución prevista y si cayó en los intervalos 80/90 %.
   3. Para los 4 óptimos (largo/corto × C/P): cotización actual del contrato
      (hub /chain) y P&L en papel:
@@ -51,6 +54,14 @@ def hub_json(ruta, **q):
 
 
 def apertura_real(ticker, hoy):
+    """Apertura oficial de la barra diaria de hoy; si no está, la 1ª vela de 1 min."""
+    try:
+        d = hub_json("/bars", ticker=ticker, dur="2 D", bar="1 day", rth=1, ttl=0)
+        fila = [b for b in d["bars"] if str(b["t"]) == hoy.strftime("%Y%m%d")]
+        if fila:
+            return float(fila[0]["o"]), float(fila[0]["c"])
+    except Exception as e:
+        log(f"[{ticker}] barra diaria no disponible ({e}); pruebo con la vela de 1 min")
     d = hub_json("/bars", ticker=ticker, dur="1 D", bar="1 min", rth=1, ttl=0)
     b = pd.DataFrame(d["bars"])
     ts = pd.to_datetime(b["t"].astype(int), unit="s", utc=True).dt.tz_convert(ET)
@@ -70,8 +81,13 @@ def cotizacion(ticker, right, expiry, strike, spot):
 
 
 def main():
-    tickers = [x.upper() for x in sys.argv[1:]] or ["SPY", "AAPL", "META", "MSFT"]
-    hoy = pd.Timestamp.now(tz=ET).date()
+    tickers = [x.upper() for x in sys.argv[1:]] or ["SPY", "AAPL", "META", "MSFT", "NVDA"]
+    ahora = pd.Timestamp.now(tz=ET)
+    hoy = ahora.date()
+    if not (dt.time(9, 31) <= ahora.time() <= dt.time(10, 5)):
+        log(f"opciones_paper: son las {ahora:%H:%M} ET, fuera de la ventana 09:31-10:05; "
+            "el P&L de opciones solo es comparable con cotizaciones de la apertura. Nada que hacer.")
+        return
     os.makedirs(HIST, exist_ok=True)
     registros = []
     ya = set()
@@ -94,6 +110,12 @@ def main():
         f_entrada = dt.datetime.fromisoformat(op["generado"]).date()
         if f_entrada >= hoy or ap["apertura_objetivo"] != str(hoy):
             log(f"[{t}] entrada del {f_entrada} con objetivo {ap['apertura_objetivo']}; hoy es {hoy}: nada que medir")
+            continue
+        if str(f_entrada) != str(ap["ultimo_cierre_fecha"]):
+            # los contratos deben haberse marcado en el cierre de la sesión que proyecta la apertura de hoy;
+            # si opciones_apertura no corrió ese día, serían de una sesión anterior y el P&L no significaría nada
+            log(f"[{t}] contratos marcados el {f_entrada}, pero la proyección es del cierre del "
+                f"{ap['ultimo_cierre_fecha']}: no se mide")
             continue
         try:
             open_real, ultimo = apertura_real(t, hoy)

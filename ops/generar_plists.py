@@ -7,15 +7,18 @@ import sys
 
 raiz = os.path.abspath(os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "..")))
 logs = os.path.expanduser("~/Library/Logs/Odyssey")
-TAREAS = (("com.odyssey.apertura-vivo", "apertura_mdn_0915.sh", [(9, 15)]),
-          ("com.odyssey.apertura-paper", "apertura_mdn_0936.sh", [(9, 36), (10, 30), (12, 30)]),   # reintentos si HMDS cae
-          ("com.odyssey.apertura-precierre", "apertura_mdn_1540.sh", [(15, 40)]))
+LAB = range(1, 6)   # lunes a viernes
+TAREAS = (("com.odyssey.apertura-aviso", "aviso_gateway.sh", [(9, 10)], LAB),
+          ("com.odyssey.apertura-vivo", "apertura_mdn_0915.sh", [(9, 15)], LAB),
+          ("com.odyssey.apertura-paper", "apertura_mdn_0936.sh", [(9, 36)], LAB),
+          ("com.odyssey.apertura-precierre", "apertura_mdn_1540.sh", [(15, 40)], LAB),
+          ("com.odyssey.apertura-semanal", "informe_semanal.sh", [(16, 30)], [5]))   # viernes
 
 
-def plist(label, script, horas):
+def plist(label, script, horas, dias):
     cal = "".join(f"\n\t\t<dict>\n\t\t\t<key>Hour</key>\n\t\t\t<integer>{hour}</integer>\n\t\t\t<key>Minute</key>\n\t\t\t<integer>{minute}</integer>"
                   f"\n\t\t\t<key>Weekday</key>\n\t\t\t<integer>{wd}</integer>\n\t\t</dict>"
-                  for hour, minute in horas for wd in range(1, 6))
+                  for hour, minute in horas for wd in dias)
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -50,7 +53,7 @@ def plist(label, script, horas):
 """
 
 
-for label, script, horas in TAREAS:
+for label, script, horas, dias in TAREAS:
     ruta = os.path.join(raiz, "ops", f"{label}.plist")
-    open(ruta, "w").write(plist(label, script, horas))
+    open(ruta, "w").write(plist(label, script, horas, dias))
     print(ruta)
