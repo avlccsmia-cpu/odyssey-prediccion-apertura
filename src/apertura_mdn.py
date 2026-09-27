@@ -90,6 +90,8 @@ ET = "America/New_York"
 COLS_ON = ["mkt_on", "pm", "pm_idio", "on_disp"]
 COLS_IV = ["iv_atm", "iv_dia", "iv_rv", "iv_chg", "skew", "iv_disp"]
 COLS_M5 = ["ret_ult30m", "ret_ult5m", "m5_disp"]
+COLS_IV30 = ["iv30", "iv30_dia", "iv30_rv", "iv30_chg", "iv30_disp"]   # IV implícita a 30 días de IBKR (15 años)
+ANOS_PREMARKET = [2]   # años de velas de 1 hora fuera de horario para el pre-market (--anos-premarket)
 AUX = ("target", "close_ref", "open_next", "fecha_next")
 torch.set_num_threads(max(1, os.cpu_count() // 2))
 
@@ -111,13 +113,15 @@ def hub_ok() -> bool:
         return False
 
 
-def hub_bars(ticker: str, dur: str, bar: str, rth: int, cache: bool = True, ttl: int = 0) -> pd.DataFrame:
+def hub_bars(ticker: str, dur: str, bar: str, rth: int, cache: bool = True, ttl: int = 0,
+             what: str = "TRADES") -> pd.DataFrame:
     """Velas IBKR por el hub. Índice: fecha naive (1 day) o timestamp ET (intradía).
     Cache en parquet válida durante el día ET en que se descargó (no para 1 min)."""
     import urllib.parse
     import urllib.request
     os.makedirs(CACHE_DIR, exist_ok=True)
-    clave = f"{ticker}_{bar.replace(' ', '')}_{dur.replace(' ', '')}_rth{rth}.parquet"
+    sufijo = "" if what == "TRADES" else f"_{what}"
+    clave = f"{ticker}_{bar.replace(' ', '')}_{dur.replace(' ', '')}_rth{rth}{sufijo}.parquet"
     ruta = os.path.join(CACHE_DIR, clave)
     ahora = pd.Timestamp.now(tz=ET)
     hoy = ahora.date()
@@ -134,7 +138,7 @@ def hub_bars(ticker: str, dur: str, bar: str, rth: int, cache: bool = True, ttl:
             return pd.read_parquet(ruta)
     import time
     import urllib.error
-    q = urllib.parse.urlencode({"ticker": ticker, "dur": dur, "bar": bar, "rth": rth, "ttl": ttl})
+    q = urllib.parse.urlencode({"ticker": ticker, "dur": dur, "bar": bar, "rth": rth, "ttl": ttl, "what": what})
     if _HUB_HIST_CAIDO[0] and cache and os.path.exists(ruta):
         return pd.read_parquet(ruta)      # ya sabemos que el histórico no responde: caché directa
     d, ultimo_err = None, None
@@ -204,9 +208,41 @@ def _serie_1h_a_hora(df1h: pd.DataFrame, hora: int, campo: str = "Close") -> pd.
     return s[~s.index.duplicated(keep="last")]
 
 
+def hub_bars_hist(ticker: str, anos: int, bar: str = "1 hour", rth: int = 0) -> pd.DataFrame:
+    """Historia larga incremental: la primera vez descarga `anos` años; después solo
+    el último mes, que se une a lo guardado. Si la descarga falla, usa lo guardado."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    ruta = os.path.join(CACHE_DIR, f"{ticker}_{bar.replace(' ', '')}_hist_rth{rth}.parquet")
+    ahora = pd.Timestamp.now(tz=ET)
+    desde = ahora - pd.DateOffset(years=anos)
+    base = pd.read_parquet(ruta) if os.path.exists(ruta) else None
+    if base is not None and len(base):
+        mt = pd.Timestamp(os.path.getmtime(ruta), unit="s", tz="UTC").tz_convert(ET)
+        tras_cierre = ahora.time() >= dt.time(16, 5)
+        fresca = mt.date() == ahora.date() and not (tras_cierre and mt.time() < dt.time(16, 5))
+        cubre = base.index.min() <= desde + pd.Timedelta(days=45)
+        if fresca and cubre:
+            return base[base.index >= desde]
+        reciente = (ahora - base.index.max()) < pd.Timedelta(days=25)
+        dur = "1 M" if (cubre and reciente) else f"{anos} Y"
+    else:
+        dur = f"{anos} Y"
+    try:
+        nuevo = hub_bars(ticker, dur, bar, rth, cache=False)
+    except Exception as e:
+        if base is not None and len(base):
+            log(f"  AVISO {ticker} {bar}: sin descarga ({e}); uso la historia guardada hasta {base.index.max():%Y-%m-%d}")
+            return base[base.index >= desde]
+        raise
+    df = nuevo if base is None else pd.concat([base, nuevo])
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    df.to_parquet(ruta)
+    return df[df.index >= desde]
+
+
 def premarket_0900(ticker: str) -> pd.Series:
     """Precio a las 09:00 ET por fecha (cierre de la vela 1h de las 08:00, rth=0, 2 Y)."""
-    return _serie_1h_a_hora(hub_bars(ticker, "2 Y", "1 hour", rth=0), 8)
+    return _serie_1h_a_hora(hub_bars_hist(ticker, ANOS_PREMARKET[0], "1 hour", rth=0), 8)
 
 
 def overnight_historico(ticker: str, diario: pd.DataFrame, spy: pd.DataFrame,
@@ -391,7 +427,22 @@ def features_5m(ticker: str, bars_dir: str, diario: pd.DataFrame) -> pd.DataFram
 # ----------------------------------------------------------------------------
 # Features
 # ----------------------------------------------------------------------------
-def construir_features(df, spy, on, iv, m5) -> pd.DataFrame:
+def features_iv30(ticker: str) -> pd.Series | None:
+    """IV implícita a 30 días del subyacente (IBKR, whatToShow OPTION_IMPLIED_VOLATILITY),
+    cierre diario de 15 años. Distinta de la IV ATM a 7-14 días de theta_vacuum / iv_diaria."""
+    try:
+        d = hub_bars(ticker, "15 Y", "1 day", rth=1, what="OPTION_IMPLIED_VOLATILITY")
+    except Exception as e:
+        log(f"  {ticker}: sin IV a 30 días de IBKR ({e})")
+        return None
+    s = d["Close"].astype(float)
+    s = s[s > 0]
+    if HASTA is not None:
+        s = s[s.index <= HASTA]
+    return s if len(s) else None
+
+
+def construir_features(df, spy, on, iv, m5, iv30=None) -> pd.DataFrame:
     """Fila t = información al cierre de t (+ overnight de t+1). Target = gap de t+1."""
     o, h, l, c, v = df["Open"], df["High"], df["Low"], df["Close"], df["Volume"]
     r = np.log(c / c.shift(1))
@@ -443,6 +494,12 @@ def construir_features(df, spy, on, iv, m5) -> pd.DataFrame:
                     "iv_rv": (iv_atm / (f["vol_20"] * math.sqrt(252))).clip(0, 5),
                     "iv_chg": iv["iv_atm"].diff().reindex(df.index),
                     "skew": iv["skew"].reindex(df.index)}, disp, "iv_disp")
+    if iv30 is not None:
+        v = iv30.reindex(df.index)
+        disp = v.notna().astype(float)
+        enmascarar({"iv30": v, "iv30_dia": v / math.sqrt(252) * 100,
+                    "iv30_rv": (v / (f["vol_20"] * math.sqrt(252))).clip(0, 5),
+                    "iv30_chg": iv30.diff().reindex(df.index)}, disp, "iv30_disp")
     if m5 is not None:
         r30 = m5["ret_ult30m"].reindex(df.index)
         disp = r30.notna().astype(float)
@@ -524,7 +581,9 @@ def muestrear(modelos, X, n_por_modelo, factor_sigma, rng) -> np.ndarray:
 
 
 class Ensamble:
-    def __init__(self, cols, train, val, args, rng):
+    def __init__(self, cols, train, val, args, rng, val_cal=None):
+        """val: parada temprana del entrenamiento; val_cal: filas para calibrar el ancho
+        (por defecto val). Así el modelo con pre-market se calibra solo en días con pre-market."""
         self.cols = cols
         self.mu_x = train[cols].mean()
         self.sd_x = train[cols].std().replace(0, 1.0)
@@ -533,8 +592,10 @@ class Ensamble:
         self.n_mc = args.mc // args.semillas
         self.factor = 1.0
         if args.calibrar:
-            base = muestrear(self.modelos, self.esc(val), self.n_mc, 1.0, rng)
-            yv = val["target"].values
+            cal = val if val_cal is None else val_cal
+            self.n_cal = int(len(cal))
+            base = muestrear(self.modelos, self.esc(cal), self.n_mc, 1.0, rng)
+            yv = cal["target"].values
             mejor, mejor_err = 1.0, 9
             for fac in np.linspace(0.7, 1.8, 45):
                 cov = np.mean([_dentro(s * fac - s.mean() * (fac - 1), y, 90) for s, y in zip(base, yv)])
@@ -606,10 +667,11 @@ def procesar(ticker, spy, spy_0900, args, rng) -> dict:
     on = overnight_historico(ticker, df, spy, spy_0900) if args.overnight else None
     iv = features_iv(ticker, args.theta_dir, args.iv_dir) if args.iv else None
     m5 = features_5m(ticker, args.bars5m_dir, df) if args.m5 else None
-    f = construir_features(df, None if ticker == "SPY" else spy, on, iv, m5)
+    iv30 = features_iv30(ticker) if args.iv30 else None
+    f = construir_features(df, None if ticker == "SPY" else spy, on, iv, m5, iv30)
     cols_all = [c for c in f.columns if c not in AUX]
     cols_sin_on = [c for c in cols_all if c not in COLS_ON]
-    cols_base = [c for c in cols_sin_on if c not in COLS_IV + COLS_M5]
+    cols_base = [c for c in cols_sin_on if c not in COLS_IV + COLS_M5 + COLS_IV30]
     f = f.dropna(subset=cols_all)
     hist = f.dropna(subset=["target"])
     ultima = f.iloc[[-1]].copy()
@@ -645,15 +707,15 @@ def procesar(ticker, spy, spy_0900, args, rng) -> dict:
     mask_val = (np.arange(len(trainval)) // 10) % 8 == 7
     train, val = trainval[~mask_val], trainval[mask_val]
     # grupos sin cobertura real en train se descartan (evita pesos no aprendidos)
-    for grupo, disp_col in (("overnight", "on_disp"), ("iv", "iv_disp"), ("m5", "m5_disp")):
+    for grupo, disp_col in (("overnight", "on_disp"), ("iv", "iv_disp"), ("m5", "m5_disp"), ("iv30", "iv30_disp")):
         if disp_col in cols_all and train[disp_col].sum() < 100:
             log(f"  grupo {grupo} con solo {int(train[disp_col].sum())} filas en train (< 100): descartado")
-            quitar = {"overnight": COLS_ON, "iv": COLS_IV, "m5": COLS_M5}[grupo]
+            quitar = {"overnight": COLS_ON, "iv": COLS_IV, "m5": COLS_M5, "iv30": COLS_IV30}[grupo]
             cols_all = [c for c in cols_all if c not in quitar]
             cols_sin_on = [c for c in cols_sin_on if c not in quitar]
             cols_base = [c for c in cols_base if c not in quitar]
     disp = {}
-    for nombre, col in (("overnight", "on_disp"), ("iv", "iv_disp"), ("m5", "m5_disp")):
+    for nombre, col in (("overnight", "on_disp"), ("iv", "iv_disp"), ("m5", "m5_disp"), ("iv30", "iv30_disp")):
         if col in f.columns:
             disp[nombre] = {"train": round(float(train[col].mean()), 3), "test": round(float(test[col].mean()), 3),
                             "hoy": bool(ultima[col].iloc[0] == 1.0)}
@@ -666,7 +728,19 @@ def procesar(ticker, spy, spy_0900, args, rng) -> dict:
     hay_on = cols_sin_on != cols_all
     con_premarket = hay_on and float(ultima["on_disp"].iloc[0]) == 1.0
     usar_sin_on = hay_on and not con_premarket
-    ens_completo = Ensamble(cols_all, train, val, args, rng) if (not usar_sin_on or args.ablacion) else None
+    val_on = val[val["on_disp"] == 1] if hay_on else None
+    cal_on = val_on if (args.calibrar_regimen and val_on is not None and len(val_on) >= 60) else None
+    train_c = train
+    if args.cal_reciente and hay_on:
+        # calibración temporal: las últimas N sesiones antes del tramo evaluado se apartan
+        # del entrenamiento del modelo con pre-market y solo sirven para fijar su ancho
+        corte = trainval.index[-args.cal_reciente]
+        cal_on = trainval[trainval.index >= corte]
+        cal_on = cal_on[cal_on["on_disp"] == 1]
+        train_c = train[train.index < corte]
+    ens_completo = (Ensamble(cols_all, train_c, val[val.index < corte] if args.cal_reciente and hay_on else val,
+                             args, rng, val_cal=cal_on)
+                    if (not usar_sin_on or args.ablacion) else None)
     ens_sin_on = Ensamble(cols_sin_on, train, val, args, rng) if (usar_sin_on or (args.ablacion and hay_on)) else None
     ens = ens_sin_on if usar_sin_on else ens_completo
     modelo_prediccion = "con_premarket" if con_premarket else "sin_premarket"
@@ -746,7 +820,7 @@ def procesar(ticker, spy, spy_0900, args, rng) -> dict:
         "modelo_prediccion": modelo_prediccion,
         "overnight_usado": ({k: (round(v, 4) if isinstance(v, float) else v) for k, v in vivo.items()} if vivo else None),
         "iv_vivo_usado": ivv,
-        "features_hoy": {c: round(float(ultima[c].iloc[0]), 4) for c in COLS_ON + COLS_IV + COLS_M5 if c in ultima.columns},
+        "features_hoy": {c: round(float(ultima[c].iloc[0]), 4) for c in COLS_ON + COLS_IV + COLS_M5 + COLS_IV30 if c in ultima.columns},
         "prob_gap_positivo": round(float((S_next > 0).mean()), 3),
         "gap_mediana_pct": round(float(np.median(S_next)), 3),
         "gap_sigma_pct": round(float(S_next.std()), 3),
@@ -845,8 +919,17 @@ def main():
     ap.add_argument("--sin-overnight", dest="overnight", action="store_false")
     ap.add_argument("--sin-iv", dest="iv", action="store_false")
     ap.add_argument("--sin-m5", dest="m5", action="store_false")
+    ap.add_argument("--sin-iv30", dest="iv30", action="store_false", help="sin la IV implícita a 30 días de IBKR")
+    ap.add_argument("--anos-premarket", type=int, default=2,
+                    help="años de velas de 1 hora para el pre-market (defecto 2; 5 años probados el 27-sep-2026: "
+                         "CRPS -8 %% pero intervalos demasiado estrechos, no adoptado)")
     ap.add_argument("--sin-ablacion", dest="ablacion", action="store_false", help="no entrenar los modelos de comparación")
     ap.add_argument("--sin-calibrar", dest="calibrar", action="store_false")
+    ap.add_argument("--cal-reciente", type=int, default=0,
+                    help="calibrar el modelo con pre-market con las últimas N sesiones apartadas del entrenamiento (0 = no)")
+    ap.add_argument("--calibrar-regimen", dest="calibrar_regimen", action="store_true",
+                    help="experimental: calibrar el modelo con pre-market solo con días con pre-market "
+                         "(probado el 27-sep-2026: estrecha más los intervalos, no adoptado)")
     ap.add_argument("--sin-informe", action="store_true")
     ap.add_argument("--theta-dir", default=THETA_DIR)
     ap.add_argument("--iv-dir", default=IV_DIARIA_DIR, help="captura propia diaria de IV (capturar_iv.py)")
@@ -860,6 +943,7 @@ def main():
 
     os.makedirs(OUT_DIR, exist_ok=True)
     global PRE_CIERRE, HASTA
+    ANOS_PREMARKET[0] = args.anos_premarket
     PRE_CIERRE = bool(args.pre_cierre)
     if args.hasta:
         if args.vivo or args.pre_cierre:

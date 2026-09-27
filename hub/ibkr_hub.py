@@ -48,7 +48,7 @@ CID_BASE  = int(os.environ.get("IBKR_HUB_CID", "300"))
 
 ESPACIADO_SEG   = float(os.environ.get("IBKR_HUB_ESPACIADO", "2.0"))
 TTL_DEFECTO_SEG = int(os.environ.get("IBKR_HUB_TTL", "60"))
-TIMEOUT_REQ_SEG = 30.0
+TIMEOUT_REQ_SEG = float(os.environ.get("IBKR_HUB_TIMEOUT", "30"))   # 27-sep-2026: configurable para descargas largas
 
 # --- 19-ago-2026: log con hora, rotacion y estado en disco -------------------
 # Nace de una investigacion que no se pudo cerrar: el log tenia 89 eventos 1100

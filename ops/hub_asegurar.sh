@@ -23,7 +23,8 @@ arrancar() {
   if ! responde && ! pgrep -f "ibkr_hub.py" >/dev/null; then
     echo "[hub_asegurar] hub no responde; arrancando ibkr_hub.py"
     mkdir -p "$LITE/logs"
-    (cd "$LITE" && IBKR_HOST=${IBKR_HOST:-127.0.0.1} IBKR_PORT=${IBKR_PORT:-4001} nohup "$PY" ibkr_hub.py >> logs/ibkr_hub.stdout 2>&1 &)
+    (cd "$LITE" && IBKR_HOST=${IBKR_HOST:-127.0.0.1} IBKR_PORT=${IBKR_PORT:-4001} IBKR_HUB_TIMEOUT=${IBKR_HUB_TIMEOUT:-180} \
+      nohup "$PY" ibkr_hub.py >> logs/ibkr_hub.stdout 2>&1 &)
   fi
 }
 vivo && exit 0
