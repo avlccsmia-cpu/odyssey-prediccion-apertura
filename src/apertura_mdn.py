@@ -84,6 +84,9 @@ PROY_DIR = os.path.join(OUT_DIR, "proyecciones")                    # archivo de
 TICKERS_DEF = ["SPY", "AAPL", "META", "MSFT", "NVDA"]
 HASTA = None   # --hasta: reconstruir la proyección con datos solo hasta ese cierre (pd.Timestamp)
 _HUB_HIST_CAIDO = [False]   # se activa al primer timeout del histórico: el resto usa caché
+PRE_APERTURA = [False]      # --vivo antes de las 9:30 ET: esperas cortas al hub y caché antes que histórico
+TIMEOUT_PRE_APERTURA = 45   # s por petición al hub antes de la apertura (fuera de ella, 300)
+HORA_APERTURA = dt.time(9, 30)
 NIVELES = [60, 65, 70, 75, 80, 85, 90, 95, 99, 100]
 ESCALERA = [99, 95, 90, 80, 70, 60, 50, 40, 30, 20, 10, 5, 2.5, 1]   # P(apertura >= precio)
 ET = "America/New_York"
@@ -103,6 +106,18 @@ def log(msg):
 # ----------------------------------------------------------------------------
 # Datos (IBKR vía hub)
 # ----------------------------------------------------------------------------
+def ultima_sesion_esperada(ahora: pd.Timestamp) -> dt.date:
+    """Última sesión que debería estar cerrada: hoy tras las 16:05 ET, si no el día hábil anterior."""
+    if ahora.time() >= dt.time(16, 5):
+        return ahora.date()
+    return (pd.Timestamp(ahora.date()) - pd.offsets.BDay(1)).date()
+
+
+def _es_espera(err) -> bool:
+    t = str(err).lower()
+    return "timeout" in t or "timed out" in t
+
+
 def hub_ok() -> bool:
     import urllib.request
     try:
@@ -116,7 +131,9 @@ def hub_ok() -> bool:
 def hub_bars(ticker: str, dur: str, bar: str, rth: int, cache: bool = True, ttl: int = 0,
              what: str = "TRADES") -> pd.DataFrame:
     """Velas IBKR por el hub. Índice: fecha naive (1 day) o timestamp ET (intradía).
-    Cache en parquet válida durante el día ET en que se descargó (no para 1 min)."""
+    Cache en parquet (no para 1 min): tras el cierre solo vale una copia bajada hoy después
+    del cierre; antes, cualquier copia que ya incluya la última sesión cerrada, para que el
+    job de las 9:15 no dependa del histórico de IBKR (28-sep-2026: 17 min perdidos)."""
     import urllib.parse
     import urllib.request
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -128,12 +145,13 @@ def hub_bars(ticker: str, dur: str, bar: str, rth: int, cache: bool = True, ttl:
     if cache and bar != "1 min" and os.path.exists(ruta):
         mt = pd.Timestamp(os.path.getmtime(ruta), unit="s", tz="UTC").tz_convert(ET)
         tras_cierre = ahora.time() >= dt.time(16, 5)
-        # fresca si se descargó hoy y, tras el cierre, después del cierre (no vale una copia de la mañana)
-        fresca = mt.date() == hoy and not (tras_cierre and mt.time() < dt.time(16, 5))
-        if fresca and bar == "1 day":
-            ult = pd.read_parquet(ruta).index[-1].date()
-            esperada = hoy if tras_cierre else (hoy - pd.offsets.BDay(1)).date()
-            fresca = ult >= esperada
+        if tras_cierre:   # no vale una copia de la mañana ni una con la vela parcial de hoy
+            fresca = mt.date() == hoy and mt.time() >= dt.time(16, 5)
+            if fresca and bar == "1 day":
+                fresca = pd.read_parquet(ruta).index[-1].date() >= hoy
+        else:             # por contenido: basta con que tenga la última sesión cerrada
+            idx = pd.read_parquet(ruta, columns=["Close"]).index
+            fresca = len(idx) > 0 and idx.max().date() >= ultima_sesion_esperada(ahora)
         if fresca:
             return pd.read_parquet(ruta)
     import time
@@ -144,7 +162,7 @@ def hub_bars(ticker: str, dur: str, bar: str, rth: int, cache: bool = True, ttl:
     d, ultimo_err = None, None
     for intento in range(4):
         try:
-            with urllib.request.urlopen(f"{HUB_URL}/bars?{q}", timeout=300) as r:
+            with urllib.request.urlopen(f"{HUB_URL}/bars?{q}", timeout=TIMEOUT_PRE_APERTURA if PRE_APERTURA[0] else 300) as r:
                 d = json.loads(r.read())
         except urllib.error.HTTPError as e:
             try:
@@ -159,14 +177,14 @@ def hub_bars(ticker: str, dur: str, bar: str, rth: int, cache: bool = True, ttl:
         if d is not None and not d.get("ok"):
             ultimo_err = d.get("error")
         log(f"  hub /bars {ticker} {bar} {dur} rth={rth}: {ultimo_err} (intento {intento + 1}/4)")
-        if "timeout" in str(ultimo_err) and intento >= 1:
-            break                          # granja HMDS caída: no insistir
+        if _es_espera(ultimo_err) and (intento >= 1 or PRE_APERTURA[0]):
+            break                          # granja HMDS caída (o antes de la apertura): no insistir
         time.sleep(5 * (intento + 1))
     if d is None or not d.get("ok") or not d.get("bars"):
         if cache and os.path.exists(ruta):
             fecha_cache = pd.Timestamp(os.path.getmtime(ruta), unit="s", tz="UTC").tz_convert(ET)
             log(f"  AVISO {ticker} {bar} {dur}: hub sin respuesta ({ultimo_err}); uso la caché del {fecha_cache:%Y-%m-%d %H:%M}")
-            if "timeout" in str(ultimo_err):
+            if _es_espera(ultimo_err):
                 _HUB_HIST_CAIDO[0] = True
             return pd.read_parquet(ruta)
         raise RuntimeError(f"hub /bars {ticker} {bar} {dur}: {ultimo_err}")
@@ -219,7 +237,8 @@ def hub_bars_hist(ticker: str, anos: int, bar: str = "1 hour", rth: int = 0) -> 
     if base is not None and len(base):
         mt = pd.Timestamp(os.path.getmtime(ruta), unit="s", tz="UTC").tz_convert(ET)
         tras_cierre = ahora.time() >= dt.time(16, 5)
-        fresca = mt.date() == ahora.date() and not (tras_cierre and mt.time() < dt.time(16, 5))
+        fresca = (mt.date() == ahora.date() and not (tras_cierre and mt.time() < dt.time(16, 5))) or \
+                 (not tras_cierre and base.index.max().date() >= ultima_sesion_esperada(ahora))
         cubre = base.index.min() <= desde + pd.Timedelta(days=45)
         if fresca and cubre:
             return base[base.index >= desde]
@@ -274,11 +293,21 @@ def spot_snapshot(ticker: str, ref: float) -> float:
     step = 1.0 if ref < 100 else (2.5 if ref < 400 else 5.0)
     q = urllib.parse.urlencode({"ticker": ticker, "right": "C", "date": expiry, "center": round(ref / step) * step,
                                 "width": 1, "step": step, "ttl": 0})
-    with urllib.request.urlopen(f"{HUB_URL}/chain?{q}", timeout=60) as r:
-        d = json.loads(r.read())
-    if not d.get("ok") or not d.get("spot"):
-        raise RuntimeError(f"snapshot sin spot: {d.get('error')}")
-    return float(d["spot"])
+    import time
+    ultimo = None
+    for intento in range(3):   # IBKR a veces no tiene aún el precio (META, 28-sep-2026 9:32)
+        try:
+            with urllib.request.urlopen(f"{HUB_URL}/chain?{q}", timeout=30 if PRE_APERTURA[0] else 60) as r:
+                d = json.loads(r.read())
+            if d.get("ok") and d.get("spot"):
+                return float(d["spot"])
+            ultimo = d.get("error") or f"respuesta sin precio (ok={d.get('ok')}, spot={d.get('spot')})"
+        except Exception as e:
+            ultimo = str(e)
+        if intento < 2:
+            log(f"  {ticker}: snapshot sin precio ({ultimo}); reintento {intento + 2}/3")
+            time.sleep(3)
+    raise RuntimeError(f"snapshot sin spot tras 3 intentos: {ultimo}")
 
 
 def _ultimo_premarket(ticker: str, fecha_cierre: pd.Timestamp, ref: float = float("nan")) -> float:
@@ -297,15 +326,18 @@ def _ultimo_premarket(ticker: str, fecha_cierre: pd.Timestamp, ref: float = floa
 
 
 def overnight_vivo(ticker: str, cierre_ref: float, fecha_cierre: pd.Timestamp, spy_close_ref: float) -> dict:
-    """Snapshot actual: pre-market del ticker y de SPY (hub 1 min rth=0) contra el último cierre."""
-    ahora = pd.Timestamp.now(tz=ET)
+    """Snapshot actual: pre-market del ticker y de SPY (hub 1 min rth=0) contra el último cierre.
+    La hora es la de después de obtener los precios; si ya es la apertura o más tarde, el precio
+    no es pre-market y la proyección queda marcada como tardía (no cuenta en la exactitud)."""
     px_pm = _ultimo_premarket(ticker, fecha_cierre, cierre_ref)
     px_spy = px_pm if ticker == "SPY" else _ultimo_premarket("SPY", fecha_cierre, spy_close_ref)
+    ahora = pd.Timestamp.now(tz=ET)
     pm = math.log(px_pm / cierre_ref) * 100 if not np.isnan(px_pm) else float("nan")
     mkt_on = math.log(px_spy / spy_close_ref) * 100 if not np.isnan(px_spy) else float("nan")
     en_ventana = ahora.date() > fecha_cierre.date() and dt.time(4, 0) <= ahora.time() <= dt.time(9, 29)
     return {"mkt_on": mkt_on, "pm": pm, "px_pm": px_pm, "px_spy": px_spy, "spy_ref": spy_close_ref,
-            "fuente_pm": "hub", "hora": ahora.isoformat(timespec="seconds"), "parcial": not en_ventana}
+            "fuente_pm": "hub", "hora": ahora.isoformat(timespec="seconds"), "parcial": not en_ventana,
+            "tardia": ahora.date() > fecha_cierre.date() and ahora.time() >= HORA_APERTURA}
 
 
 def guardar_snapshot(ticker: str, fecha: pd.Timestamp, s: dict):
@@ -686,6 +718,9 @@ def procesar(ticker, spy, spy_0900, args, rng) -> dict:
                 guardar_snapshot(ticker, pd.Timestamp(ultima["fecha_next"].iloc[0]), vivo)
         log(f"  overnight vivo: SPY {vivo['mkt_on']:+.2f}% ({vivo['spy_ref']:.2f} -> {vivo['px_spy']:.2f})  "
             f"PM {vivo['pm']:+.2f}% (hub {vivo['px_pm']})  parcial={vivo['parcial']}")
+        if vivo["tardia"]:
+            log(f"  PROYECCIÓN TARDÍA {ticker}: precio tomado a las {vivo['hora'][11:16]} ET, después de la apertura; "
+                "no cuenta en la exactitud ni sustituye la proyección vigente")
     elif args.overnight:
         ultima.loc[:, COLS_ON] = 0.0
     ivv = None
@@ -817,6 +852,9 @@ def procesar(ticker, spy, spy_0900, args, rng) -> dict:
         "modo": ("reconstruida" if HASTA is not None else "vivo" if vivo else "pre_cierre" if args.pre_cierre
                  else "cierre_sin_overnight" if args.overnight else "solo_cierres"),
         "reconstruida": HASTA is not None,
+        "valida": not (vivo and vivo.get("tardia")),
+        "motivo_invalida": (f"pre-market tomado a las {vivo['hora'][11:16]} ET, después de la apertura"
+                            if vivo and vivo.get("tardia") else None),
         "modelo_prediccion": modelo_prediccion,
         "overnight_usado": ({k: (round(v, 4) if isinstance(v, float) else v) for k, v in vivo.items()} if vivo else None),
         "iv_vivo_usado": ivv,
@@ -945,6 +983,7 @@ def main():
     global PRE_CIERRE, HASTA
     ANOS_PREMARKET[0] = args.anos_premarket
     PRE_CIERRE = bool(args.pre_cierre)
+    PRE_APERTURA[0] = bool(args.vivo) and pd.Timestamp.now(tz=ET).time() < HORA_APERTURA
     if args.hasta:
         if args.vivo or args.pre_cierre:
             ap.error("--hasta no se combina con --vivo ni --pre-cierre")
@@ -967,9 +1006,11 @@ def main():
         resultados.append(r)
         if not args.etiqueta:
             archivar_proyeccion(r)
-        if HASTA is None:
+        if HASTA is None and r["valida"]:
             with open(os.path.join(OUT_DIR, f"apertura_mdn_{t}{args.etiqueta}.json"), "w") as fh:
                 json.dump(r, fh, indent=1, ensure_ascii=False)
+        elif HASTA is None:
+            log(f"[{t}] proyección no válida ({r['motivo_invalida']}): archivada, la vigente no cambia")
         print(f"\n{t}: cierre {r['ultimo_cierre_fecha']} = {r['ultimo_cierre']}  ->  apertura {r['apertura_objetivo']}   "
               f"P(gap>0)={r['prob_gap_positivo']:.0%}  modo={r['modo']}")
         print(f"  {'Prob':>6} {'Open mín':>10} {'Open máx':>10} {'Gap mín%':>9} {'Gap máx%':>9}")

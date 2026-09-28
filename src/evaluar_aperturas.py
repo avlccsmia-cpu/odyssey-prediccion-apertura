@@ -158,6 +158,7 @@ def main():
             "ticker": t, "apertura_objetivo": r["apertura_objetivo"], "fecha_apertura_real": str(f_open.date()),
             "modo": r["modo"], "reconstruida": bool(r.get("reconstruida", False)), "generado": r["generado"],
             "modelo_prediccion": r.get("modelo_prediccion", "anterior"),
+            "valida": r.get("valida", True), "motivo_invalida": r.get("motivo_invalida"),
             "cierre_ref_fecha": r["ultimo_cierre_fecha"], "cierre_ref": c0, "open_real": round(o, 4),
             "gap_real_pct": round(gap, 4), "gap_mediana_pct": r["gap_mediana_pct"],
             "p_gap_pos": r.get("prob_gap_positivo"), "pit": round(pit, 4),
@@ -176,7 +177,7 @@ def main():
                 fh.write(json.dumps(e, ensure_ascii=False) + "\n")
     print(f"evaluar_aperturas: {len(nuevas)} nuevas, {esperando} esperando su apertura")
     for e in nuevas:
-        print(f"  {e['apertura_objetivo']} {e['ticker']:5} {e['modo']:20} gap {e['gap_real_pct']:+.2f}% "
+        print(f"  {e['apertura_objetivo']} {e['ticker']:5} {e['modo']:20}{' [NO VÁLIDA]' if e['valida'] is False else ''} gap {e['gap_real_pct']:+.2f}% "
               f"(prev {e['gap_mediana_pct']:+.2f}%)  pit {e['pit']:.2f}  en80 {'sí' if e.get('en80') else 'no'}  "
               f"crps {e['crps_modelo']:.3f} vs emp {e['crps_empirico'] if e['crps_empirico'] is not None else float('nan'):.3f}")
 

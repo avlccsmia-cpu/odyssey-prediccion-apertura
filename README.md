@@ -79,7 +79,7 @@ cp -R "Oddyssey Prediccion de apertura" ~/Odyssey   # o cualquier ruta fuera del
 cd ~/Odyssey
 python3 ops/generar_plists.py ~/Odyssey
 for l in com.odyssey.apertura-aviso com.odyssey.apertura-vivo com.odyssey.apertura-paper \
-         com.odyssey.apertura-precierre com.odyssey.apertura-semanal; do
+         com.odyssey.apertura-precierre com.odyssey.apertura-cierre com.odyssey.apertura-semanal; do
   cp "ops/$l.plist" ~/Library/LaunchAgents/
   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/$l.plist
 done
@@ -91,7 +91,12 @@ done
 | 09:15 | proyección con el pre-market vivo | 09:27 |
 | 09:36 | evalúa las proyecciones pendientes y mide el P&L en papel | 09:50 |
 | 15:40 | captura IV, proyección `--pre-cierre`, strikes, evaluación pendiente | 15:52 |
+| 16:20 | proyección tras el cierre con el cierre real; deja la caché lista para las 9:15 | 16:35 |
 | vie 16:30 | informe semanal y aviso | 90 s |
+
+Antes de la apertura, `--vivo` usa la caché si ya tiene la última sesión y espera como mucho 45 s
+al hub; si el precio del pre-market se toma a las 9:30 o después, la proyección se marca como
+tardía (`valida: false`): se archiva, no sustituye a la vigente y no cuenta en la exactitud.
 
 Si el gateway no conecta antes de la hora límite, el job avisa en el Mac
 (`ops/notificar.sh`, registro en `logs/avisos.log`).

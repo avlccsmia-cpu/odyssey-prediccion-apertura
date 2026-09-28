@@ -40,6 +40,8 @@ def cargar(out_dir):
     if not os.path.exists(ruta):
         return pd.DataFrame()
     e = pd.DataFrame([json.loads(l) for l in open(ruta) if l.strip()])
+    if "valida" in e:   # proyecciones tardías (pre-market tomado tras la apertura): fuera de la exactitud
+        e = e[e["valida"].map(lambda v: v is not False)]
     if "modelo_prediccion" not in e:
         e["modelo_prediccion"] = "anterior"
     e["modelo_prediccion"] = e["modelo_prediccion"].fillna("anterior")

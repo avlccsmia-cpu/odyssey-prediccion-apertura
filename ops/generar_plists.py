@@ -12,6 +12,7 @@ TAREAS = (("com.odyssey.apertura-aviso", "aviso_gateway.sh", [(9, 10)], LAB),
           ("com.odyssey.apertura-vivo", "apertura_mdn_0915.sh", [(9, 15)], LAB),
           ("com.odyssey.apertura-paper", "apertura_mdn_0936.sh", [(9, 36)], LAB),
           ("com.odyssey.apertura-precierre", "apertura_mdn_1540.sh", [(15, 40)], LAB),
+          ("com.odyssey.apertura-cierre", "apertura_mdn_1620.sh", [(16, 20)], LAB),
           ("com.odyssey.apertura-semanal", "informe_semanal.sh", [(16, 30)], [5]))   # viernes
 
 
